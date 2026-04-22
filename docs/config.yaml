@@ -1552,6 +1552,27 @@ listeners:
     #   dC5jb20AAA==
     #   -----END ECH KEYS-----
 
+  # tailscale 服务转发（需要 with_tailscale build tag）
+  # 在 tailnet 上暴露本机服务；每条 forward 默认同时监听 TCP 和 UDP
+  # - name: ts-services
+  #   type: tailscale
+  #   auth-key: tskey-auth-xxxxxxxxxxxxxxxx              # 可选，首次接入用
+  #   hostname: ts-services                              # 可选，节点机器名
+  #   # control-url: https://controlplane.tailscale.com  # 可选，默认官方控制面板
+  #   # ephemeral: false                                 # 可选，临时节点
+  #   # state-dir: /path/to/state                        # 可选，默认 <HomeDir>/tailscale/<hostname-or-name>/
+  #   # rule: sub-rule-name1                             # 可选，子规则
+  #   # proxy: proxy                                     # 可选，全局指定出站代理
+  #   forwards:
+  #     - listen: 22                                     # tailnet 侧端口，例如 100.x.y.z:22
+  #       target: 127.0.0.1:22                           # 本机服务地址
+  #     - listen: 53
+  #       target: 127.0.0.1:53
+  #       network: udp                                   # 可选，默认 auto = tcp + udp
+  #     - listen: 80
+  #       target: 127.0.0.1:8080
+  #       # proxy: proxy                                 # 可选，单条转发覆盖全局 proxy
+
   - name: redir-in-1
     type: redir
     port: 10811 # 支持使用ports格式，例如200,302 or 200,204,401-429,501-503

@@ -40,20 +40,22 @@ func NewUDP(addr, target, proxy string, tunnel C.Tunnel, additions ...inbound.Ad
 		return nil, err
 	}
 
+	return NewUDPWithPacketConn(l, addr, target, proxy, tunnel, additions...)
+}
+
+func NewUDPWithPacketConn(l net.PacketConn, rawAddr, target, proxy string, tunnel C.Tunnel, additions ...inbound.Addition) (*PacketConn, error) {
 	targetAddr := socks5.ParseAddr(target)
 	if targetAddr == nil {
 		return nil, fmt.Errorf("invalid target address %s", target)
 	}
 
+	additions = appendProxyAddition(additions, proxy)
+
 	sl := &PacketConn{
 		conn:   l,
 		target: targetAddr,
 		proxy:  proxy,
-		addr:   addr,
-	}
-
-	if proxy != "" {
-		additions = append([]inbound.Addition{inbound.WithSpecialProxy(proxy)}, additions...)
+		addr:   rawAddr,
 	}
 
 	go func() {

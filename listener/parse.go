@@ -148,6 +148,13 @@ func ParseListener(mapping map[string]any) (C.InboundListener, error) {
 			return nil, err
 		}
 		listener, err = IN.NewTrustTunnel(trusttunnelOption)
+	case "tailscale":
+		tailscaleOption := &IN.TailscaleOption{}
+		err = decoder.Decode(mapping, tailscaleOption)
+		if err != nil {
+			return nil, err
+		}
+		listener, err = IN.NewTailscale(tailscaleOption)
 	default:
 		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}

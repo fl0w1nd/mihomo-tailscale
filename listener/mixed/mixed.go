@@ -114,9 +114,26 @@ func NewWithConfig(config LC.AuthServer, tunnel C.Tunnel, additions ...inbound.A
 		l = tls.NewListener(l, tlsConfig)
 	}
 
+	return newListener(l, config.Listen, config, tunnel, isDefault, additions...), nil
+}
+
+func NewWithListener(l net.Listener, rawAddr string, config LC.AuthServer, tunnel C.Tunnel, additions ...inbound.Addition) *Listener {
+	isDefault := false
+	if len(additions) == 0 {
+		isDefault = true
+		additions = []inbound.Addition{
+			inbound.WithInName("DEFAULT-MIXED"),
+			inbound.WithSpecialRules(""),
+		}
+	}
+
+	return newListener(l, rawAddr, config, tunnel, isDefault, additions...)
+}
+
+func newListener(l net.Listener, addr string, config LC.AuthServer, tunnel C.Tunnel, isDefault bool, additions ...inbound.Addition) *Listener {
 	ml := &Listener{
 		listener: l,
-		addr:     config.Listen,
+		addr:     addr,
 	}
 	go func() {
 		for {
@@ -140,8 +157,7 @@ func NewWithConfig(config LC.AuthServer, tunnel C.Tunnel, additions ...inbound.A
 			go handleConn(c, tunnel, store, additions...)
 		}
 	}()
-
-	return ml, nil
+	return ml
 }
 
 func handleConn(conn net.Conn, tunnel C.Tunnel, store auth.AuthStore, additions ...inbound.Addition) {

@@ -3,13 +3,19 @@
 package outbound
 
 import (
+	"context"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	ts "github.com/metacubex/mihomo/component/tailscale"
 	"github.com/metacubex/mihomo/constant"
 
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsnet"
 )
 
 func TestSanitizeTailscaleHostname(t *testing.T) {
@@ -50,8 +56,8 @@ func TestSanitizeTailscaleHostname(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := sanitizeTailscaleHostname(tt.hostname, tt.fallback); got != tt.want {
-				t.Fatalf("sanitizeTailscaleHostname() = %q, want %q", got, tt.want)
+			if got := ts.SanitizeHostname(tt.hostname, tt.fallback); got != tt.want {
+				t.Fatalf("SanitizeHostname() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -110,5 +116,55 @@ func TestMatchPeer(t *testing.T) {
 				t.Fatalf("matchPeer(%q) = false, want true", raw)
 			}
 		})
+	}
+}
+
+func TestTailscaleInitRunsOnceUnderConcurrency(t *testing.T) {
+	t.Parallel()
+
+	var startCalls atomic.Int32
+	var syncCalls atomic.Int32
+
+	proxy := &Tailscale{
+		option: TailscaleOption{Name: "ts-concurrent"},
+		startInstance: func(context.Context) (*tsnet.Server, error) {
+			startCalls.Add(1)
+			time.Sleep(20 * time.Millisecond)
+			return &tsnet.Server{}, nil
+		},
+		syncExitNodePreferenceFunc: func(context.Context) error {
+			syncCalls.Add(1)
+			time.Sleep(20 * time.Millisecond)
+			return nil
+		},
+	}
+
+	const concurrency = 32
+	var wg sync.WaitGroup
+	errCh := make(chan error, concurrency)
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errCh <- proxy.init(context.Background())
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("init() returned error: %v", err)
+		}
+	}
+
+	if got := startCalls.Load(); got != 1 {
+		t.Fatalf("startInstance() call count = %d, want 1", got)
+	}
+	if got := syncCalls.Load(); got != 1 {
+		t.Fatalf("syncExitNodePreference() call count = %d, want 1", got)
+	}
+	if !proxy.initOk.Load() {
+		t.Fatal("expected initOk to be true after successful init")
 	}
 }

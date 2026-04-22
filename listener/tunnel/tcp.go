@@ -43,20 +43,22 @@ func New(addr, target, proxy string, tunnel C.Tunnel, additions ...inbound.Addit
 		return nil, err
 	}
 
+	return NewWithListener(l, addr, target, proxy, tunnel, additions...)
+}
+
+func NewWithListener(l net.Listener, rawAddr, target, proxy string, tunnel C.Tunnel, additions ...inbound.Addition) (*Listener, error) {
 	targetAddr := socks5.ParseAddr(target)
 	if targetAddr == nil {
 		return nil, fmt.Errorf("invalid target address %s", target)
 	}
 
+	additions = appendProxyAddition(additions, proxy)
+
 	rl := &Listener{
 		listener: l,
 		target:   targetAddr,
 		proxy:    proxy,
-		addr:     addr,
-	}
-
-	if proxy != "" {
-		additions = append([]inbound.Addition{inbound.WithSpecialProxy(proxy)}, additions...)
+		addr:     rawAddr,
 	}
 
 	go func() {
@@ -73,4 +75,11 @@ func New(addr, target, proxy string, tunnel C.Tunnel, additions ...inbound.Addit
 	}()
 
 	return rl, nil
+}
+
+func appendProxyAddition(additions []inbound.Addition, proxy string) []inbound.Addition {
+	if proxy == "" {
+		return additions
+	}
+	return append(additions, inbound.WithSpecialProxy(proxy))
 }

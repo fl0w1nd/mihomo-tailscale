@@ -73,6 +73,30 @@ func NewUDP(addr string, tunnel C.Tunnel, additions ...inbound.Addition) (*UDPLi
 	return sl, nil
 }
 
+func NewUDPWithPacketConn(pc net.PacketConn, rawAddr string, tunnel C.Tunnel, additions ...inbound.Addition) *UDPListener {
+	sl := &UDPListener{
+		packetConn: pc,
+		addr:       rawAddr,
+	}
+	conn := N.NewEnhancePacketConn(pc)
+	go func() {
+		for {
+			data, put, remoteAddr, err := conn.WaitReadFrom()
+			if err != nil {
+				if put != nil {
+					put()
+				}
+				if sl.closed {
+					break
+				}
+				continue
+			}
+			handleSocksUDP(pc, tunnel, data, put, remoteAddr, additions...)
+		}
+	}()
+	return sl
+}
+
 func handleSocksUDP(pc net.PacketConn, tunnel C.Tunnel, buf []byte, put func(), addr net.Addr, additions ...inbound.Addition) {
 	target, payload, err := socks5.DecodeUDPPacket(buf)
 	if err != nil {

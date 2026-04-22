@@ -3,7 +3,7 @@
   <br>mihomo + Tailscale<br>
 </h1>
 
-<h3 align="center">mihomo fork with built-in Tailscale outbound proxy support via tsnet.</h3>
+<h3 align="center">mihomo fork with built-in Tailscale outbound routing and inbound service forwarding via tsnet.</h3>
 
 <p align="center">
   <a href="https://github.com/MetaCubeX/mihomo">
@@ -15,15 +15,19 @@
 
 ## Overview
 
-This is a personal fork of [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) (based on the `Alpha` branch) that adds **`type: tailscale`** as a first-class outbound proxy adapter. It embeds [tsnet](https://pkg.go.dev/tailscale.com/tsnet) so that any Tailscale node can be used as a regular outbound in mihomo's rule system — without running a separate `tailscaled` daemon.
+A personal fork of [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) (based on the `Alpha` branch) that adds two Tailscale capabilities behind the `with_tailscale` build tag:
 
-All upstream features remain intact. The Tailscale integration is isolated behind the `with_tailscale` build tag, so the default binary is completely unchanged.
+- **Outbound routing** via `type: tailscale` in `proxies`, using [tsnet](https://pkg.go.dev/tailscale.com/tsnet) as a first-class outbound adapter.
+- **Inbound service forwarding** via `type: tailscale` in `listeners`, exposing selected local services on the node's Tailscale IPs.
+
+All upstream features remain intact. The Tailscale integration is isolated behind the `with_tailscale` build tag — the default binary is identical to upstream.
 
 ## What's Different from Upstream
 
 | Area | Upstream mihomo | This Fork |
 |---|---|---|
 | Tailscale outbound | Not available | `type: tailscale` proxy adapter via tsnet |
+| Tailscale service forwards | Not available | `type: tailscale` listener with multi-port forwards |
 | Go version | `go 1.20` | `go 1.26.1` (required by tailscale.com v1.96.5) |
 | Binary size | Baseline | +~32 MB when built with `with_tailscale` tag |
 | Default build | Unaffected | Identical — stub returns an error if tailscale type is used |
@@ -32,9 +36,16 @@ All upstream features remain intact. The Tailscale integration is isolated behin
 
 | File | Purpose |
 |---|---|
-| `adapter/outbound/tailscale.go` | Core adapter (`//go:build with_tailscale`) |
+| `adapter/outbound/tailscale.go` | Outbound adapter (`//go:build with_tailscale`) |
 | `adapter/outbound/tailscale_stub.go` | Stub (`//go:build !with_tailscale`) — returns error |
+| `adapter/outbound/tailscale_udp_bind.go` | UDP bind address selection for outbound |
 | `adapter/outbound/tailscale_test.go` | Unit tests for hostname sanitization, peer matching, option validation |
+| `adapter/outbound/tailscale_udp_bind_test.go` | Unit tests for UDP bind selection |
+| `component/tailscale/server.go` | Shared tsnet lifecycle management |
+| `component/tailscale/server_stub.go` | Stub for the shared lifecycle layer |
+| `listener/inbound/tailscale.go` | Tailscale listener with service forwards |
+| `listener/inbound/tailscale_stub.go` | Stub for tailscale listener support |
+| `listener/inbound/tailscale_test.go` | Tests for forward startup and rollback paths |
 | `component/tailscalestamp/stamp.go` | Patches Tailscale version stamp at runtime to avoid `ERR-BuildInfo` |
 | `component/tailscalestamp/stamp_test.go` | Verifies version stamp is correctly populated |
 | `constant/features/with_tailscale.go` | Feature flag `WithTailscale = true` |
@@ -47,12 +58,17 @@ All upstream features remain intact. The Tailscale integration is isolated behin
 | `go.mod` | `go 1.20` → `1.26.1`; added `tailscale.com v1.96.5` |
 | `constant/adapters.go` | Added `Tailscale` enum and `String()` case |
 | `adapter/parser.go` | Added `case "tailscale"` in `ParseProxy` |
+| `listener/parse.go` | Added `case "tailscale"` in `ParseListener` |
+| `listener/tunnel/tcp.go` | Added listener reuse constructor for forwarded TCP services |
+| `listener/tunnel/udp.go` | Added packet-conn reuse constructor for forwarded UDP services |
 | `constant/features/tags.go` | `with_tailscale` appears in `mihomo -v` output |
-| `docs/config.yaml` | Added tailscale configuration example |
+| `docs/config.yaml` | Added tailscale outbound and inbound examples |
 
 ## Configuration
 
-### Minimal Example
+### Outbound
+
+Minimal example:
 
 ```yaml
 proxies:
@@ -62,13 +78,13 @@ proxies:
     hostname: mihomo-exit
 ```
 
-### Full Example
+Full example with all options:
 
 ```yaml
 proxies:
   - name: ts-exit
     type: tailscale
-    auth-key: tskey-auth-xxxxxxxxxxxxxxxxxxxxx  # Required on first run; can be removed after state is persisted
+    auth-key: tskey-auth-xxxxxxxxxxxxxxxxxxxxx  # Required on first run; removable after state is persisted
     hostname: mihomo-exit                        # Hostname shown in Tailscale admin console
     control-url: https://controlplane.tailscale.com  # Optional, default is the official control plane
     ephemeral: false                             # Optional, true = node auto-removed after going offline
@@ -82,34 +98,91 @@ rules:
   - MATCH,DIRECT
 ```
 
-### Option Reference
+### Outbound Option Reference
 
 | Option | Required | Default | Description |
 |---|---|---|---|
-| `name` | Yes | — | Unique proxy name. Must be unique across all tailscale proxies in the same mihomo instance. |
+| `name` | Yes | — | Unique proxy name within the mihomo instance. |
 | `type` | Yes | — | Must be `tailscale`. |
-| `auth-key` | First run | — | Tailscale auth key (`tskey-auth-...`). Required for initial authentication; once state is persisted, it can be removed. |
-| `hostname` | No | `<name>` | Hostname visible in Tailscale admin console. Sanitized to DNS label format automatically. |
-| `control-url` | No | Official Tailscale | Custom control plane URL (e.g. for Headscale). |
-| `ephemeral` | No | `false` | If `true`, the node is automatically removed from the tailnet 30–60 minutes after going offline. |
-| `exit-node` | No | — | Specifies an exit node to route all traffic through. Accepts FQDN, HostName, Tailscale IP, or StableNodeID. Omitting this clears any persisted exit node selection. |
-| `state-dir` | No | `<HomeDir>/tailscale/<name>/` | Directory for persisting Tailscale node state (keys, preferences, etc.). |
+| `auth-key` | First run | — | Tailscale auth key (`tskey-auth-...`). Can be removed once state is persisted. |
+| `hostname` | No | `<name>` | Hostname visible in Tailscale admin console. Sanitized to DNS label format. |
+| `control-url` | No | Official Tailscale | Custom control plane URL (e.g., for Headscale). |
+| `ephemeral` | No | `false` | If `true`, the node is removed from the tailnet after going offline. |
+| `exit-node` | No | — | Exit node for routing. Accepts FQDN, HostName, Tailscale IP, or StableNodeID. Omitting clears any persisted selection. |
+| `state-dir` | No | `<HomeDir>/tailscale/<hostname\|name>/` | Directory for persisting node state. |
 
-### Options That Do NOT Apply
+### Inapplicable Options
 
-The following `BasicOption` fields are silently ignored because tsnet manages its own sockets:
+The following `BasicOption` fields are ignored because tsnet manages its own sockets:
 
-`dialer-proxy`, `interface-name`, `routing-mark`, `ip-version`, `tfo`, `mptcp`
+`dialer-proxy` · `interface-name` · `routing-mark` · `ip-version` · `tfo` · `mptcp`
 
 A warning is logged at startup if any of these are set.
 
 ### Operational Notes
 
-- **First run** requires `auth-key`. After the node state is persisted to `state-dir`, the key can be removed from the config.
-- **Long-lived nodes** should have "Disable key expiry" enabled in the Tailscale admin console.
-- **Exit node fallback**: If the specified exit node is unavailable at startup, the adapter falls back to direct routing through the Tailscale node and logs a warning. It does **not** automatically pick another exit node.
-- **Lazy initialization**: The tsnet server is started on the first `Dial`/`ListenPacket` call, not at mihomo startup. This avoids blocking the start of other proxies.
-- **Multiple tailscale proxies**: You can define multiple `type: tailscale` proxies in the same mihomo instance. Each must have a unique `name` (which determines its state directory).
+- **First run** requires `auth-key`. After state is persisted to `state-dir`, the key can be removed.
+- **Long-lived nodes** should have key expiry disabled in the Tailscale admin console.
+- **Exit node fallback**: if the specified exit node is unavailable, the adapter falls back to direct routing and logs a warning. It does not automatically select another exit node.
+- **Lazy initialization**: the tsnet server starts on the first `Dial`/`ListenPacket` call, not at mihomo startup.
+- **Multiple proxies**: each `type: tailscale` proxy runs an independent tsnet instance with its own state.
+
+### Inbound Service Forwarding
+
+`listeners.type: tailscale` exposes local services on the node's Tailscale IPs. Each forward maps a tailnet-side port to a local target.
+
+```yaml
+listeners:
+  - name: ts-services
+    type: tailscale
+    auth-key: tskey-auth-xxxxxxxxxxxxxxxxxxxxx
+    hostname: mihomo-services
+    # control-url: https://controlplane.tailscale.com
+    # ephemeral: false
+    # state-dir: /var/lib/mihomo/tailscale/mihomo-services
+    # rule: custom-sub-rule
+    # proxy: proxy-name
+    forwards:
+      - listen: 22
+        target: 127.0.0.1:22
+      - listen: 80
+        target: 127.0.0.1:8080
+      - listen: 53
+        target: 127.0.0.1:53
+        network: udp
+```
+
+### Inbound Option Reference
+
+Listener-level options:
+
+| Option | Required | Default | Description |
+|---|---|---|---|
+| `name` | Yes | — | Listener name. |
+| `type` | Yes | — | Must be `tailscale`. |
+| `auth-key` | First run | — | Tailscale auth key for the listener node. |
+| `hostname` | No | `<name>` | Hostname shown in the Tailscale admin console. |
+| `control-url` | No | Official Tailscale | Custom control plane URL. |
+| `ephemeral` | No | `false` | Creates an ephemeral listener node. |
+| `state-dir` | No | `<HomeDir>/tailscale/<hostname\|name>/` | State directory for this listener node. |
+| `rule` | No | — | Sub-rule name applied to forwarded traffic. |
+| `proxy` | No | — | Global outbound override for all forwards on this listener. |
+| `forwards` | Yes | — | List of tailnet-side ports to expose. |
+
+Per-forward options:
+
+| Option | Required | Default | Description |
+|---|---|---|---|
+| `listen` | Yes | — | Tailnet-side port to expose (e.g., `22`). |
+| `target` | Yes | — | Local or routed destination in `host:port` form. |
+| `network` | No | `auto` | `auto` = TCP + UDP. `tcp` or `udp` for a single protocol. |
+| `proxy` | No | inherit listener `proxy` | Per-forward outbound override. |
+
+### Forwarding Notes
+
+- Forwards listen on the node's Tailscale IPs, not on the host's regular network interfaces.
+- A single Tailscale listener node can expose many forwarded ports through one shared tsnet instance.
+- Forwarding is explicit per port. Userspace tsnet does not provide TUN-style transparent interception.
 
 ## Building
 
@@ -123,7 +196,7 @@ A warning is logged at startup if any of these are set.
 go build ./...
 ```
 
-The binary is identical to upstream. Using `type: tailscale` in the config will return an error.
+The binary is identical to upstream. Using `type: tailscale` in the config returns an error.
 
 ### Build with Tailscale
 
@@ -141,7 +214,7 @@ CGO_ENABLED=0 go build \
   -o bin/mihomo .
 ```
 
-### Cross-Compilation Examples
+### Cross-Compilation
 
 ```bash
 # macOS ARM64
@@ -175,21 +248,29 @@ go test -tags with_tailscale ./adapter/outbound/ ./component/tailscalestamp/ -v
 ## Architecture
 
 ```
+component/tailscale/server.go
+├── Instance              Shared tsnet lifecycle manager
+├── Start()               Create state dir → resolver bypass → tsnet.Up()
+└── Close()               server.Close() + release resolver bypass
+
 adapter/outbound/tailscale.go
-├── TailscaleOption        YAML → Go struct mapping
-├── Tailscale struct       Embeds *Base, holds *tsnet.Server
-├── init()                 Double-checked locking lazy init (mirrors wireguard.go)
-│   ├── Create stateDir (<HomeDir>/tailscale/<name>/)
-│   ├── Acquire stdlib resolver bypass (held until Close)
-│   ├── tsnet.Server.Up()
-│   └── syncExitNodePreference()
-├── setupExitNode()        LocalClient().EditPrefs() → set ExitNodeID
-├── clearExitNode()        Clear persisted ExitNodeID/IP/AutoExitNode
-├── resolveExitNode()      Match peer by ID / DNSName / HostName / IP
-├── DialContext()          server.Dial("tcp") → backfill remote IP → NewConn()
-├── ListenPacketContext()  server.Dial("udp") → fakePacketConn wrapper
-├── Close()                server.Close() + release resolver bypass
-└── IsL3Protocol()         true (same as WireGuard)
+├── TailscaleOption       YAML → Go struct mapping
+├── Tailscale             Embeds *Base, holds *tailscale.Instance
+├── init()                Double-checked one-time init + exit-node sync
+├── setupExitNode()       LocalClient().EditPrefs() → set ExitNodeID
+├── clearExitNode()       Clear persisted ExitNodeID/IP/AutoExitNode
+├── resolveExitNode()     Match peer by ID / DNSName / HostName / IP
+├── DialContext()         server.Dial("tcp") → backfill remote IP → NewConn()
+├── ListenPacketContext() pickTailscaleUDPBind() → server.ListenPacket("udp")
+└── Close()               instance.Close()
+
+listener/inbound/tailscale.go
+├── TailscaleOption       Listener-level config + forwards list
+├── TailscaleForward      Per-port forward entry
+├── Listen()              Start shared tsnet instance → create forwards
+├── listenOnServer()      Create TCP/UDP forwards on tailnet ports
+├── listenForwardUDP()    Bind concrete TS IPv4/IPv6 UDP sockets
+└── Close()               Close all forward listeners + instance
 ```
 
 ### Design Decisions
@@ -197,13 +278,15 @@ adapter/outbound/tailscale.go
 | Decision | Rationale |
 |---|---|
 | Build tag isolation | tsnet adds ~32 MB; not compiled by default |
-| Lazy initialization | First Dial triggers Up(), avoids blocking startup |
-| Resolver bypass held per instance lifetime | tsnet continues to use stdlib resolver during operation |
+| Lazy init (outbound) | First Dial triggers Up(), avoids blocking startup |
+| Eager init (inbound) | Ports must be ready before traffic arrives |
+| Resolver bypass per instance | tsnet uses stdlib resolver internally; bypass must span the server lifetime |
 | Exit node as declarative state | Setting overwrites previous; omitting clears persisted state |
 | Silent fallback when exit node unavailable | No ExitNodeID = direct routing; warning log is the only signal |
-| State dir isolated by name | Multiple tailscale proxies don't conflict |
-| UDP via Dial("udp") + fakePacketConn | tsnet's ListenPacket is for inbound; Dial("udp") suits outbound |
-| Runtime version stamp patching | Keeps control plane version display correct; avoids `ERR-BuildInfo` |
+| State dir keyed by hostname or name | Human-readable layout with stable defaults |
+| Inbound forwards default to `network: auto` | One entry exposes the same port on both TCP and UDP |
+| Explicit per-port service exposure | Userspace tsnet only supports explicit listeners, not TUN-style interception |
+| Runtime version stamp patching | Keeps control plane version display accurate; avoids `ERR-BuildInfo` |
 
 ## Keeping Up with Upstream
 
@@ -213,7 +296,7 @@ This fork tracks `upstream/Alpha`. The `tailscale-dev` branch contains all tails
 
 ```bash
 git fetch upstream Alpha
-git log --oneline HEAD..upstream/Alpha | head -20  # check what's new
+git log --oneline HEAD..upstream/Alpha | head -20
 git rebase upstream/Alpha
 
 # After resolving conflicts:
@@ -222,15 +305,15 @@ go mod tidy
 go build ./... && go build -tags with_tailscale ./...
 ```
 
-### Conflict Resolution Cheat Sheet
+### Conflict Resolution
 
 | File | Rule |
 |---|---|
-| `go.mod` | Keep `go 1.26.1` (don't regress to upstream's 1.20) |
+| `go.mod` | Keep `go 1.26.1` |
 | `constant/adapters.go` | `Tailscale` stays at the end of the enum |
 | `adapter/parser.go` | `case "tailscale"` stays right before `default` |
 
-### Upgrading Tailscale Version
+### Upgrading Tailscale
 
 ```bash
 go list -m -versions tailscale.com | tr ' ' '\n' | tail -10
@@ -246,6 +329,7 @@ go build ./... && go build -tags with_tailscale ./...
 - First run requires `auth-key`; state is persisted afterward
 - If the specified exit node is unavailable, traffic falls back silently to direct routing
 - All `tailscale` proxy names must be unique within the same mihomo instance
+- Inbound service forwarding is explicit per port; userspace tsnet does not provide transparent forwarding
 - UPX does not support macOS binaries; use gzip for distribution
 
 ## Credits

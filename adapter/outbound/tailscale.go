@@ -7,14 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 
 	"github.com/metacubex/mihomo/common/atomic"
-	_ "github.com/metacubex/mihomo/component/tailscalestamp"
+	ts "github.com/metacubex/mihomo/component/tailscale"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 
@@ -23,7 +21,6 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
-	"tailscale.com/types/logger"
 )
 
 type TailscaleOption struct {
@@ -39,22 +36,17 @@ type TailscaleOption struct {
 
 type Tailscale struct {
 	*Base
-	option TailscaleOption
-	server *tsnet.Server
+	option   TailscaleOption
+	instance *ts.Instance
+	server   *tsnet.Server // cached after first init
+
+	startInstance              func(context.Context) (*tsnet.Server, error)
+	syncExitNodePreferenceFunc func(context.Context) error
 
 	initOk    atomic.Bool
 	initMutex sync.Mutex
 	initErr   error
-
-	resolverDialHeld bool
 }
-
-var (
-	hostnameRegexp        = regexp.MustCompile(`[^a-z0-9-]`)
-	defaultResolverMu     sync.Mutex
-	defaultResolverUsers  int
-	defaultResolverDialFn func(ctx context.Context, network, address string) (net.Conn, error)
-)
 
 func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	option = normalizeTailscaleOption(option)
@@ -66,6 +58,15 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		log.Warnln("[TS](%s) ignoring unsupported options: %s", option.Name, strings.Join(unsupported, ", "))
 	}
 
+	instance := ts.NewInstance(ts.ServerOptions{
+		Name:       option.Name,
+		AuthKey:    option.AuthKey,
+		Hostname:   option.Hostname,
+		ControlURL: option.ControlURL,
+		Ephemeral:  option.Ephemeral,
+		StateDir:   option.StateDir,
+	})
+
 	t := &Tailscale{
 		Base: NewBase(BaseOption{
 			Name:         option.Name,
@@ -73,8 +74,11 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 			ProviderName: option.ProviderName,
 			UDP:          true,
 		}),
-		option: option,
+		option:   option,
+		instance: instance,
 	}
+	t.startInstance = instance.Start
+	t.syncExitNodePreferenceFunc = t.syncExitNodePreference
 
 	return t, nil
 }
@@ -92,43 +96,14 @@ func (t *Tailscale) init(ctx context.Context) error {
 		return t.initErr
 	}
 
-	stateDir := t.option.StateDir
-	if stateDir == "" {
-		stateDir = filepath.Join(C.Path.HomeDir(), "tailscale", t.option.Name)
+	server, err := t.startInstance(ctx)
+	if err != nil {
+		t.initErr = err
+		return err
 	}
-	if err := os.MkdirAll(stateDir, 0700); err != nil {
-		t.initErr = fmt.Errorf("create tailscale state dir: %w", err)
-		return t.initErr
-	}
+	t.server = server
 
-	acquireSystemResolverDial()
-	t.resolverDialHeld = true
-
-	tsLogf := func(format string, args ...any) {
-		log.Debugln("[TS](%s) %s", t.option.Name, fmt.Sprintf(format, args...))
-	}
-	tsUserLogf := func(format string, args ...any) {
-		log.Infoln("[TS](%s) %s", t.option.Name, fmt.Sprintf(format, args...))
-	}
-
-	t.server = &tsnet.Server{
-		Dir:        stateDir,
-		AuthKey:    t.option.AuthKey,
-		Hostname:   sanitizeTailscaleHostname(t.option.Hostname, t.option.Name),
-		ControlURL: t.option.ControlURL,
-		Ephemeral:  t.option.Ephemeral,
-		Logf:       logger.Logf(tsLogf),
-		UserLogf:   logger.Logf(tsUserLogf),
-	}
-
-	if _, err := t.server.Up(ctx); err != nil {
-		_ = t.server.Close()
-		t.server = nil
-		t.releaseSystemResolverDial()
-		return fmt.Errorf("tailscale up: %w", err)
-	}
-
-	if err := t.syncExitNodePreference(ctx); err != nil {
+	if err := t.syncExitNodePreferenceFunc(ctx); err != nil {
 		if t.option.ExitNode != "" {
 			log.Warnln("[TS](%s) failed to set exit node %q: %v, falling back to direct", t.option.Name, t.option.ExitNode, err)
 		} else {
@@ -270,13 +245,8 @@ func (t *Tailscale) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 
 // Close implements C.ProxyAdapter
 func (t *Tailscale) Close() error {
-	defer t.releaseSystemResolverDial()
-	if t.server != nil {
-		err := t.server.Close()
-		t.server = nil
-		return err
-	}
-	return nil
+	t.server = nil
+	return t.instance.Close()
 }
 
 // IsL3Protocol implements C.ProxyAdapter
@@ -300,22 +270,6 @@ func normalizeTailscaleOption(option TailscaleOption) TailscaleOption {
 		option.StateDir = filepath.Clean(option.StateDir)
 	}
 	return option
-}
-
-func sanitizeTailscaleHostname(hostname, fallback string) string {
-	if hostname == "" {
-		hostname = fallback
-	}
-	hostname = strings.ToLower(hostname)
-	hostname = hostnameRegexp.ReplaceAllString(hostname, "-")
-	hostname = strings.Trim(hostname, "-")
-	if len(hostname) > 63 {
-		hostname = strings.Trim(hostname[:63], "-")
-	}
-	if hostname == "" {
-		return "mihomo"
-	}
-	return hostname
 }
 
 func describeUnsupportedTailscaleOptions(option TailscaleOption) []string {
@@ -353,40 +307,4 @@ func updateMetadataRemoteIP(metadata *C.Metadata, addr net.Addr) {
 	if remote.DstIP.IsValid() {
 		metadata.DstIP = remote.DstIP
 	}
-}
-
-func acquireSystemResolverDial() {
-	defaultResolverMu.Lock()
-	defer defaultResolverMu.Unlock()
-
-	if defaultResolverUsers == 0 {
-		defaultResolverDialFn = net.DefaultResolver.Dial
-		net.DefaultResolver.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, network, address)
-		}
-	}
-	defaultResolverUsers++
-}
-
-func releaseSystemResolverDial() {
-	defaultResolverMu.Lock()
-	defer defaultResolverMu.Unlock()
-
-	if defaultResolverUsers == 0 {
-		return
-	}
-	defaultResolverUsers--
-	if defaultResolverUsers == 0 {
-		net.DefaultResolver.Dial = defaultResolverDialFn
-		defaultResolverDialFn = nil
-	}
-}
-
-func (t *Tailscale) releaseSystemResolverDial() {
-	if !t.resolverDialHeld {
-		return
-	}
-	releaseSystemResolverDial()
-	t.resolverDialHeld = false
 }
