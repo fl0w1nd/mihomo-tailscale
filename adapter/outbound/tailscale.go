@@ -256,15 +256,16 @@ func (t *Tailscale) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 	if err = t.init(ctx); err != nil {
 		return nil, err
 	}
-	// TODO: tsnet.Server.Dial with "udp" returns a net.Conn, not a net.PacketConn.
-	// If this doesn't work correctly in practice, fall back to t.server.ListenPacket("udp", ":0")
-	// and use WriteTo to send packets to the target address.
-	conn, err := t.server.Dial(ctx, "udp", metadata.RemoteAddress())
+	ip4, ip6 := t.server.TailscaleIPs()
+	bindAddr, err := pickTailscaleUDPBind(metadata.DstIP, ip4, ip6)
 	if err != nil {
 		return nil, err
 	}
-	updateMetadataRemoteIP(metadata, conn.RemoteAddr())
-	return newPacketConn(newFakePacketConn(conn), t), nil
+	pc, err := t.server.ListenPacket("udp", bindAddr)
+	if err != nil {
+		return nil, err
+	}
+	return newPacketConn(pc, t), nil
 }
 
 // Close implements C.ProxyAdapter
@@ -286,24 +287,6 @@ func (t *Tailscale) IsL3Protocol(metadata *C.Metadata) bool {
 // ProxyInfo implements C.ProxyAdapter
 func (t *Tailscale) ProxyInfo() C.ProxyInfo {
 	return t.Base.ProxyInfo()
-}
-
-// fakePacketConn wraps a net.Conn to implement net.PacketConn for UDP-over-Dial.
-type fakePacketConn struct {
-	net.Conn
-}
-
-func newFakePacketConn(conn net.Conn) *fakePacketConn {
-	return &fakePacketConn{Conn: conn}
-}
-
-func (c *fakePacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	n, err = c.Conn.Read(p)
-	return n, c.Conn.RemoteAddr(), err
-}
-
-func (c *fakePacketConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
-	return c.Conn.Write(p)
 }
 
 func normalizeTailscaleOption(option TailscaleOption) TailscaleOption {
