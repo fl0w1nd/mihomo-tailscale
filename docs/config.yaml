@@ -1075,6 +1075,22 @@ proxies: # socks5
     #   j3: <t><b 0xf6ab><c><r 10>                        # AmneziaWG v1.5 only (removed in v2)
     #   itime: 60                                         # AmneziaWG v1.5 only (removed in v2)
 
+  # tailscale (需要 with_tailscale build tag)
+  - name: ts-main
+    type: tailscale
+    auth-key: tskey-auth-xxxxxxxxxxxxxxxx  # 首次接入必需，状态持久化后可删除
+    hostname: ts-main                       # 可选，呈现给 Tailscale 控制面板的主机名
+    # control-url: https://controlplane.tailscale.com  # 可选，默认官方控制面板
+    # ephemeral: false                      # 可选，设为 true 则离线后自动清理节点
+    # exit-node: exit-gateway.example.ts.net # 可选，指定 exit node（支持 FQDN / HostName / IP / StableNodeID）
+    # state-dir: /path/to/state             # 可选，默认 <HomeDir>/tailscale/<name>/
+    # 注意：
+    #   - dialer-proxy / interface-name / routing-mark / ip-version / tfo / mptcp 对 tailscale 不生效（tsnet 自管 socket）
+    #   - 长期使用节点务必在 Tailscale 管理台勾 Disable key expiry
+    #   - Ephemeral 节点离线 30-60 分钟后被自动清理
+    #   - 去掉 exit-node 配置会清空该实例持久化的 exit node 选择
+    #   - 同一 mihomo 实例内所有 tailscale 代理的 name 必须唯一
+
   # masque
   - name: "masque"
     type: masque

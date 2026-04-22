@@ -13,5 +13,8 @@ func Tags() (tags []string) {
 	if WithGVisor {
 		tags = append(tags, "with_gvisor")
 	}
+	if WithTailscale {
+		tags = append(tags, "with_tailscale")
+	}
 	return
 }

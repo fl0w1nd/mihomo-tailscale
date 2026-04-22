@@ -26,3 +26,11 @@ test/config/cache*
 /output
 .vscode/
 .fleet/
+
+# AGENTS
+/.claude
+/.agents
+/AGENTS.md
+/CLAUDE.md
+
+test/tailscale-debug/
