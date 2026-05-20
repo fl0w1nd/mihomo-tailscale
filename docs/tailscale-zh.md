@@ -130,12 +130,15 @@ rules:
 启动后行为：
 
 1. ApplyConfig 期间出站先 `Acquire`（refcount=1，但不立即 Start）；接着入站 `Acquire` 命中同一身份 → refcount=2，**直接复用**同一个 `Instance`。
-2. 入站随即在 `Listen()` 里 `Start`，触发 `tsnet.Up()` 注册设备；端口立刻可用。
-3. mihomo 启动完成、`OnRunning` 之后的 warmup 阶段，出站发现 `initOk` 已置位，直接返回——不会再起一次 tsnet，也不会注册第二台设备。
-4. `accept-routes: true` 在 tsnet 完成 `Up()` 之后立即生效；如果只在出站这一侧写了 `accept-routes`、入站没写，第一个 `Acquire` 的设置会胜出（first-wins）。
-5. **auth-key 的 bootstrap 行为**：如果出站没写 auth-key（依赖既有持久化状态），入站写了 auth-key，由于出站先 Acquire 时缓存的 auth-key 为空、共享 `Instance` 仍处于 idle 状态，入站这次 Acquire 会把 auth-key 自动「过继」到共享身份上，紧接着的 `Start` 用这把 key 完成首次认证。日志会看到 `adopting auth-key from later Acquire on shared identity`。一旦 `Start()` 已经取走 option 快照，后续 auth-key 会进入 WARN 路径。
+2. 入站 `Listen()` **立即返回 nil**，同时启动后台 goroutine 调用 `Instance.Start()` 触发 `tsnet.Up()` 注册设备；mihomo 主流程（API / TUN / 其他 listener）**不受任何阻塞**，即使 tailscale 网络不可达或 auth-key 错误也只影响这台 listener 自己的可用时机。
+3. 后台 goroutine 每次握手有 60s 上限（`startAttemptTimeout`），失败按 1s → 60s 指数退避自动重试，直到成功或 listener 被关闭；这意味着控制面恢复后端口会自动可用，无需用户干预。日志能看到 `bring-up attempt N failed: ... (retry in ...)`；成功一次后输出 `forwards listening at: tcp://...,udp://...`。
+4. mihomo 启动完成、`OnRunning` 之后的 warmup 阶段，出站发现 `initOk` 已置位（如果入站抢先 Start 完成）直接返回；否则出站独立完成自己的 lazy init，但两路依然共享同一台 `Instance`、控制面板始终只显示一台设备。
+5. `accept-routes: true` 在 tsnet 完成 `Up()` 之后立即生效；入站默认也是 `true`（与出站对齐），所以共享身份时不会有 first-wins WARN 噪音。如果你显式把某一侧写成 `false`、另一侧写成 `true`，第一个 `Acquire` 的设置会胜出。
+6. **auth-key 的 bootstrap 行为**：如果出站没写 auth-key（依赖既有持久化状态），入站写了 auth-key，由于出站先 Acquire 时缓存的 auth-key 为空、共享 `Instance` 仍处于 idle 状态，入站这次 Acquire 会把 auth-key 自动「过继」到共享身份上，紧接着的 `Start` 用这把 key 完成首次认证。日志会看到 `adopting auth-key from later Acquire on shared identity`。一旦 `Start()` 已经取走 option 快照，后续 auth-key 会进入 WARN 路径。
 
 控制面板上始终只会显示一台名为 `ts-home` 的设备。
+
+> 注意：入站 listener 的握手是异步的，端口从 mihomo 配置生效到实际可用之间会有几秒到几十秒（首次注册设备）的窗口。这段时间访问 tailnet 上的对应端口会被拒绝，等到日志里出现 `forwards listening at: ...` 后才正式可用。如果握手长期失败（比如 auth-key 错误），日志会持续打印 `bring-up attempt N failed ... (retry in ...)`，但不会影响 mihomo 主流程。
 
 ---
 
@@ -168,7 +171,7 @@ rules:
 | `hostname` | 否 | `<name>` | **身份锚点**；和出站填同样的值即可共享 tsnet |
 | `control-url` | 否 | 官方 | — |
 | `ephemeral` | 否 | `false` | — |
-| `accept-routes` | 否 | unset | 留空表示继承共享实例已有设置 |
+| `accept-routes` | 否 | `true` | 与出站默认对齐；显式写值则按 first-wins 在共享实例上生效 |
 | `state-dir` | 否 | `<HomeDir>/tailscale/<hostname-or-name>/` | **身份锚点** |
 | `rule` | 否 | — | 子规则名，作用于转发流量 |
 | `proxy` | 否 | — | 全局出站覆盖：所有 forward 默认走哪个 proxy |
@@ -289,7 +292,13 @@ tsnet 内部使用 Go 标准库 resolver；mihomo 在启动 tsnet 时会把 `net
 
 ### Q3：首次启动卡在 `tsnet.Up()` 没动静
 
-通常是 `auth-key` 失效或控制面板不可达。日志里会出现 `[TS](xxx) Logf: ...` 级别的 tsnet 输出，可以根据信息定位。注意 `auth-key` 是一次性的，过期重发即可。
+入站 listener 的握手在后台异步进行，不会阻塞 mihomo 主流程；如果背景 goroutine 一直失败，日志会持续打印 `Tailscale[<name>] bring-up attempt N failed: ... (retry in ...)`，通常原因是 `auth-key` 失效、控制面板不可达，或者防火墙拦截了 tsnet 的 DERP / WireGuard 出站。`[TS](<name>) Logf: ...` 一行会带出 tsnet 自身的诊断信息，按其指引修即可——修好之后无需 reload，下一轮退避到期就会自动重新尝试。
+
+出站这一侧是 lazy 的（首次拨号或 warmup 触发）；如果出站 warmup 卡住，主流程同样不阻塞，只会在 5 分钟超时后日志里出现 `startup warmup failed: ...`，下次 Dial 会再试一次。
+
+### Q3.1：mihomo 主进程会被 tailscale 卡住吗？
+
+不会。`Listen()` 同步返回 nil，整个握手在 per-listener 的 goroutine 里跑，并被 `lifecycleCtx` + 60s 单次握手超时双重约束。即使配置写错了 `auth-key`，mihomo 的 API、TUN、其他 listener、其他出站都能正常起来，只有这台 tailscale listener 的 forward 端口暂时不可用，并在每次退避到期自动重试。`Close()`（reload / 退出）触发的 lifecycle 取消会让 goroutine 立刻退出，不会留下僵尸。
 
 ### Q4：UDP 转发为什么需要绑定具体 IP？
 

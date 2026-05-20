@@ -132,8 +132,9 @@ A warning is logged at startup if any of these are set.
 - **First run** requires `auth-key`. After state is persisted to `state-dir`, the key can be removed.
 - **Long-lived nodes** should have key expiry disabled in the Tailscale admin console.
 - **Exit node fallback**: if the specified exit node is unavailable, the adapter falls back to direct routing and logs a warning. It does not automatically select another exit node.
-- **Lazy initialization**: the outbound tsnet server starts on the first `Dial`/`ListenPacket` call (or via the post-startup warmup pass), not at mihomo startup.
-- **Lifecycle-bound warmup**: `Close()` cancels any in-flight warmup or lazy init before releasing the shared instance, so stale config generations stop cleanly during reload.
+- **Lazy initialization (outbound)**: the outbound tsnet server starts on the first `Dial`/`ListenPacket` call (or via the post-startup warmup pass), not at mihomo startup.
+- **Async initialization (inbound)**: `Listen()` returns immediately after acquiring the shared instance; the tsnet handshake runs in a per-listener goroutine with a bounded per-attempt timeout (60s) and exponential backoff (1s → 60s) on failure. **mihomo's main `ApplyConfig` path never blocks on the Tailscale handshake** — if the control plane is silent or the auth-key is wrong, only the affected listener's forwards stay pending and retry in the background until they succeed or `Close()` is called. Forwards become available the moment the handshake completes (`forwards listening at: ...` log line).
+- **Lifecycle-bound bring-up**: `Close()` cancels the per-listener context, waits for the bring-up goroutine to exit, then releases the shared instance. Both `Close()` and the registry's release closure are idempotent.
 - **Shared identity**: an outbound proxy and an inbound listener that resolve to the same identity tuple (`state-dir`, `control-url`, sanitized `hostname`-or-`name`) share a single tsnet server. They appear as **one device** on the Tailscale control plane. Differently named entries remain fully independent.
 
 ### Sharing One Tailnet Identity Between Outbound and Inbound
@@ -206,7 +207,7 @@ Listener-level options:
 | `hostname` | No | `<name>` | Hostname shown in the Tailscale admin console. Identity anchor — match it to an outbound entry to share a single tsnet. |
 | `control-url` | No | Official Tailscale | Custom control plane URL. |
 | `ephemeral` | No | `false` | Creates an ephemeral listener node. |
-| `accept-routes` | No | unset | Node-level subnet-route acceptance. Leave unset to inherit whatever the shared instance already has; set explicitly to enforce a value when this listener is the sole holder of the identity. |
+| `accept-routes` | No | `true` | Node-level subnet-route acceptance. Defaults match outbound so a shared identity sees no first-wins conflict. Explicit `false` (on either side) will be honored under first-wins semantics. |
 | `state-dir` | No | `<HomeDir>/tailscale/<hostname\|name>/` | State directory. Pair it with an outbound entry on the same directory to share the tsnet identity. |
 | `rule` | No | — | Sub-rule name applied to forwarded traffic. |
 | `proxy` | No | — | Global outbound override for all forwards on this listener. |
@@ -226,7 +227,7 @@ Per-forward options:
 - Forwards listen on the node's Tailscale IPs, not on the host's regular network interfaces.
 - A single Tailscale listener node can expose many forwarded ports through one shared tsnet instance.
 - Forwarding is explicit per port. Userspace tsnet does not provide TUN-style transparent interception.
-- When the listener shares its identity with an outbound proxy, `Listen()` starts the shared Instance eagerly so ports are ready before traffic arrives, and `Start()` on the first caller takes the node-level snapshot for that shared identity.
+- Bring-up is asynchronous: `Listen()` registers the listener and returns; a per-listener goroutine drives `Instance.Start()` and creates the TCP/UDP forwards. Until the goroutine succeeds, `Address()` returns the empty string and tailnet traffic to the configured ports is refused. Failures are logged as `Tailscale[<name>] bring-up attempt N failed: ...` and retried with exponential backoff; recovery is automatic once the underlying issue (auth-key, DNS, firewall) is resolved.
 
 ## Building
 
@@ -318,10 +319,11 @@ adapter/outbound/tailscale.go
 listener/inbound/tailscale.go
 ├── TailscaleOption           Listener-level config + forwards list (incl. accept-routes)
 ├── TailscaleForward          Per-port forward entry
-├── Listen()                  Acquire shared Instance → Start → create forwards
-├── listenOnServer()          Create TCP/UDP forwards on tailnet ports
-├── listenForwardUDP()        Bind concrete TS IPv4/IPv6 UDP sockets
-└── Close()                   Close forward listeners + release()
+├── Listen()                  Acquire shared Instance → spawn async bring-up goroutine, return nil
+├── runBringUp()              Lifecycle-bounded goroutine: Start + setupForwards with exp-backoff retry
+├── setupForwards()           Create TCP/UDP forwards on tailnet ports (with rollback on partial failure)
+├── openForwardUDP()          Bind concrete TS IPv4/IPv6 UDP sockets
+└── Close()                   Cancel lifecycle, wait for goroutine, close listeners + release()
 ```
 
 ### Design Decisions
@@ -330,7 +332,7 @@ listener/inbound/tailscale.go
 |---|---|
 | Build tag isolation | tsnet adds ~32 MB; not compiled by default |
 | Lazy init (outbound) | First Dial triggers Up(), avoids blocking startup; warmup pre-flights after `OnRunning` |
-| Eager init (inbound) | Ports must be ready before traffic arrives |
+| Async init (inbound) | `Listen()` returns immediately; the tsnet handshake runs in a per-listener goroutine with bounded per-attempt timeout and exponential backoff retry, so mihomo's main `ApplyConfig` never blocks on a slow / unreachable control plane. Trade-off: forwards are "eventually ready" instead of ready the instant `Listen()` returns |
 | Identity-keyed registry + refcount | Outbound and inbound sharing one identity register exactly one device on the control plane; refcount lets each adapter own its own lifecycle without coordinating directly |
 | 5s grace close on refcount = 0 | Config reload runs Close-then-Listen; the grace window prevents the tsnet from briefly dropping and re-registering |
 | First-wins on conflicting node prefs (auth-key promotes on idle empty cache) | `ephemeral` / `accept-routes` / mismatched non-empty `auth-key` keep the original value with a WARN. The carve-out: an empty cached `auth-key` can be promoted from a follow-up Acquire supplying one before the first `Start()` attempt takes its option snapshot, with an INFO log. |
