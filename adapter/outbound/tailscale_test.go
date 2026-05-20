@@ -4,6 +4,7 @@ package outbound
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -166,5 +167,226 @@ func TestTailscaleInitRunsOnceUnderConcurrency(t *testing.T) {
 	}
 	if !proxy.initOk.Load() {
 		t.Fatal("expected initOk to be true after successful init")
+	}
+}
+
+// TestTailscaleInitPropagatesContext verifies that the caller-supplied
+// context is honored by both startInstance and the post-Up sync. The
+// previous version of init() captured a context.Background() internally,
+// which silently made tsnet.Up unbounded; this regression test fails if
+// that behavior is reintroduced.
+func TestTailscaleInitPropagatesContext(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	proxy := &Tailscale{
+		option: TailscaleOption{Name: "ts-ctx"},
+		startInstance: func(ctx context.Context) (*tsnet.Server, error) {
+			close(started)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		syncExitNodePreferenceFunc: func(context.Context) error {
+			return nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- proxy.init(ctx)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("init did not enter startInstance promptly")
+	}
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("init returned nil after ctx cancel, expected error")
+		}
+		if proxy.initOk.Load() {
+			t.Fatal("initOk should not be true after init failure")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("init did not return after ctx cancel; caller ctx is being ignored")
+	}
+}
+
+func TestTailscaleInitLockWaitHonorsContext(t *testing.T) {
+	t.Parallel()
+
+	var startCalls atomic.Int32
+	proxy := &Tailscale{
+		option: TailscaleOption{Name: "ts-lock-ctx"},
+		startInstance: func(context.Context) (*tsnet.Server, error) {
+			startCalls.Add(1)
+			return &tsnet.Server{}, nil
+		},
+		syncExitNodePreferenceFunc: func(context.Context) error {
+			return nil
+		},
+	}
+
+	proxy.initMutex.Lock()
+	defer proxy.initMutex.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	err := proxy.init(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("init error = %v, want context deadline exceeded", err)
+	}
+	if got := startCalls.Load(); got != 0 {
+		t.Fatalf("startInstance call count = %d, want 0", got)
+	}
+}
+
+func TestWarmupAfterCloseDoesNotStart(t *testing.T) {
+	t.Parallel()
+
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	var startCalls atomic.Int32
+	proxy := &Tailscale{
+		option:          TailscaleOption{Name: "ts-closed"},
+		lifecycleCtx:    lifecycleCtx,
+		cancelLifecycle: cancelLifecycle,
+		startInstance: func(context.Context) (*tsnet.Server, error) {
+			startCalls.Add(1)
+			return &tsnet.Server{}, nil
+		},
+		syncExitNodePreferenceFunc: func(context.Context) error {
+			return nil
+		},
+	}
+
+	if err := proxy.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	proxy.Warmup(context.Background())
+
+	if got := startCalls.Load(); got != 0 {
+		t.Fatalf("startInstance call count = %d, want 0", got)
+	}
+}
+
+func TestCloseCancelsRunningWarmup(t *testing.T) {
+	t.Parallel()
+
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	done := make(chan struct{})
+	var startCalls atomic.Int32
+	proxy := &Tailscale{
+		option:          TailscaleOption{Name: "ts-close-cancel"},
+		lifecycleCtx:    lifecycleCtx,
+		cancelLifecycle: cancelLifecycle,
+		startInstance: func(ctx context.Context) (*tsnet.Server, error) {
+			startCalls.Add(1)
+			close(started)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		syncExitNodePreferenceFunc: func(context.Context) error {
+			return nil
+		},
+	}
+
+	go func() {
+		proxy.Warmup(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("Warmup did not enter startInstance")
+	}
+
+	if err := proxy.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Warmup did not return after Close")
+	}
+	if got := startCalls.Load(); got != 1 {
+		t.Fatalf("startInstance call count = %d, want 1", got)
+	}
+	if proxy.initOk.Load() {
+		t.Fatal("initOk should not be true after Close cancels Warmup")
+	}
+}
+
+// TestWarmupSkipsWhenInitInProgress verifies that the TryLock fast-path
+// in Warmup keeps follow-up ApplyConfig goroutines from accumulating
+// behind an already-running init. The first Warmup holds initMutex
+// (simulated by blocking inside startInstance); subsequent Warmups must
+// return immediately rather than queueing on the mutex.
+func TestWarmupSkipsWhenInitInProgress(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	proceed := make(chan struct{})
+	var startCalls atomic.Int32
+	proxy := &Tailscale{
+		option: TailscaleOption{Name: "ts-pile"},
+		startInstance: func(ctx context.Context) (*tsnet.Server, error) {
+			startCalls.Add(1)
+			close(started)
+			<-proceed
+			return &tsnet.Server{}, nil
+		},
+		syncExitNodePreferenceFunc: func(context.Context) error {
+			return nil
+		},
+	}
+
+	go proxy.Warmup(context.Background())
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first Warmup did not enter startInstance")
+	}
+
+	const piledUp = 8
+	done := make(chan struct{}, piledUp)
+	deadline := time.After(500 * time.Millisecond)
+	for range piledUp {
+		go func() {
+			proxy.Warmup(context.Background())
+			done <- struct{}{}
+		}()
+	}
+	for i := 0; i < piledUp; i++ {
+		select {
+		case <-done:
+		case <-deadline:
+			t.Fatalf("Warmup %d/%d did not return promptly; goroutines are piling up on initMutex", i+1, piledUp)
+		}
+	}
+
+	close(proceed)
+
+	deadline = time.After(2 * time.Second)
+	for !proxy.initOk.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("first Warmup never finished")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	if got := startCalls.Load(); got != 1 {
+		t.Fatalf("startInstance call count = %d, want 1", got)
 	}
 }

@@ -66,6 +66,7 @@ type TailscaleOption struct {
 	ControlURL   string             `inbound:"control-url,omitempty"`
 	Ephemeral    bool               `inbound:"ephemeral,omitempty"`
 	StateDir     string             `inbound:"state-dir,omitempty"`
+	AcceptRoutes *bool              `inbound:"accept-routes,omitempty"`
 	Forwards     []TailscaleForward `inbound:"forwards"`
 }
 
@@ -147,17 +148,22 @@ func (t *TailscaleListener) Address() string {
 func (t *TailscaleListener) Listen(tunnel C.Tunnel) (err error) {
 	cfg := t.config
 
-	t.instance = ts.NewInstance(ts.ServerOptions{
-		Name:       cfg.NameStr,
-		AuthKey:    cfg.AuthKey,
-		Hostname:   cfg.Hostname,
-		ControlURL: cfg.ControlURL,
-		Ephemeral:  cfg.Ephemeral,
-		StateDir:   cfg.StateDir,
+	instance, release := ts.Acquire(ts.ServerOptions{
+		Name:         cfg.NameStr,
+		AuthKey:      cfg.AuthKey,
+		Hostname:     cfg.Hostname,
+		ControlURL:   cfg.ControlURL,
+		Ephemeral:    cfg.Ephemeral,
+		StateDir:     cfg.StateDir,
+		AcceptRoutes: cfg.AcceptRoutes,
 	})
-	t.closeInstance = t.instance.Close
+	t.instance = instance
+	t.closeInstance = func() error {
+		release()
+		return nil
+	}
 
-	server, err := t.instance.Start(context.Background())
+	server, err := instance.Start(context.Background())
 	if err != nil {
 		err = fmt.Errorf("tailscale listener start: %w", err)
 		if closeErr := t.Close(); closeErr != nil {

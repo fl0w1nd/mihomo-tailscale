@@ -24,6 +24,7 @@ type TailscaleOption struct {
 	ControlURL   string             `inbound:"control-url,omitempty"`
 	Ephemeral    bool               `inbound:"ephemeral,omitempty"`
 	StateDir     string             `inbound:"state-dir,omitempty"`
+	AcceptRoutes *bool              `inbound:"accept-routes,omitempty"`
 	Forwards     []TailscaleForward `inbound:"forwards"`
 }
 

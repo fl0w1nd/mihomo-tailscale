@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
@@ -105,8 +106,8 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateGeneral(cfg.General, true)
 	updateNTP(cfg.NTP)
 	updateDNS(cfg.DNS, cfg.General.IPv6)
-	updateListeners(cfg.General, cfg.Listeners, force)
 	updateTun(cfg.General) // tun should not care "force"
+	updateListeners(cfg.General, cfg.Listeners, force)
 	updateIPTables(cfg)
 	updateTunnels(cfg.Tunnels)
 
@@ -121,6 +122,34 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateUpdater(cfg)
 
 	resolver.ResetConnection()
+
+	// Eagerly warm up outbounds that benefit from doing so (e.g. tailscale,
+	// whose tsnet.Up() handshake can take seconds on first run). Must run
+	// AFTER OnRunning so it is strictly ordered after updateTun() and the
+	// rest of ApplyConfig. TUN is also created before custom listeners because
+	// tailscale listeners eagerly start tsnet from Listen(), which temporarily
+	// overrides the process-wide net.DefaultResolver.Dial.
+	go warmupOutbounds(cfg.Proxies)
+}
+
+// warmupOutbounds invokes Warmup on every outbound that opts into it.
+// Each warmup runs in its own goroutine with a generous timeout because a
+// first-run tsnet authentication may legitimately take minutes.
+func warmupOutbounds(proxies map[string]C.Proxy) {
+	type warmupable interface {
+		Warmup(context.Context)
+	}
+	for _, p := range proxies {
+		w, ok := p.Adapter().(warmupable)
+		if !ok {
+			continue
+		}
+		go func(w warmupable) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			w.Warmup(ctx)
+		}(w)
+	}
 }
 
 func initInnerTcp() {

@@ -20,7 +20,11 @@ A personal fork of [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) (base
 - **Outbound routing** via `type: tailscale` in `proxies`, using [tsnet](https://pkg.go.dev/tailscale.com/tsnet) as a first-class outbound adapter.
 - **Inbound service forwarding** via `type: tailscale` in `listeners`, exposing selected local services on the node's Tailscale IPs.
 
+Outbound and inbound automatically **share a single tsnet identity** when configured with the same `hostname` / `state-dir` / `control-url` — so a typical "outbound + inbound on the same node" deployment registers exactly one device on the Tailscale control plane.
+
 All upstream features remain intact. The Tailscale integration is isolated behind the `with_tailscale` build tag — the default binary is identical to upstream.
+
+> 中文文档：[docs/tailscale-zh.md](docs/tailscale-zh.md) 提供完整的中文使用教程，包含部署示例、共享身份配置和常见问题。
 
 ## What's Different from Upstream
 
@@ -41,8 +45,9 @@ All upstream features remain intact. The Tailscale integration is isolated behin
 | `adapter/outbound/tailscale_udp_bind.go` | UDP bind address selection for outbound |
 | `adapter/outbound/tailscale_test.go` | Unit tests for hostname sanitization, peer matching, option validation |
 | `adapter/outbound/tailscale_udp_bind_test.go` | Unit tests for UDP bind selection |
-| `component/tailscale/server.go` | Shared tsnet lifecycle management |
+| `component/tailscale/server.go` | Shared tsnet lifecycle with identity-keyed registry and refcounted instance sharing |
 | `component/tailscale/server_stub.go` | Stub for the shared lifecycle layer |
+| `component/tailscale/server_test.go` | Tests for `Acquire` / release / grace-period close / first-wins conflict policy |
 | `listener/inbound/tailscale.go` | Tailscale listener with service forwards |
 | `listener/inbound/tailscale_stub.go` | Stub for tailscale listener support |
 | `listener/inbound/tailscale_test.go` | Tests for forward startup and rollback paths |
@@ -50,6 +55,7 @@ All upstream features remain intact. The Tailscale integration is isolated behin
 | `component/tailscalestamp/stamp_test.go` | Verifies version stamp is correctly populated |
 | `constant/features/with_tailscale.go` | Feature flag `WithTailscale = true` |
 | `constant/features/with_tailscale_stub.go` | Feature flag `WithTailscale = false` |
+| `docs/tailscale-zh.md` | Chinese-language tutorial for the Tailscale integration |
 
 ### Modified Files
 
@@ -89,6 +95,7 @@ proxies:
     control-url: https://controlplane.tailscale.com  # Optional, default is the official control plane
     ephemeral: false                             # Optional, true = node auto-removed after going offline
     exit-node: exit-gateway.example.ts.net       # Optional, route all traffic through this exit node
+    accept-routes: true                          # Optional, default true; accept subnet routes advertised by tailnet peers
     state-dir: /var/lib/mihomo/tailscale/ts-exit # Optional, default is <HomeDir>/tailscale/<name>/
 
 rules:
@@ -109,7 +116,8 @@ rules:
 | `control-url` | No | Official Tailscale | Custom control plane URL (e.g., for Headscale). |
 | `ephemeral` | No | `false` | If `true`, the node is removed from the tailnet after going offline. |
 | `exit-node` | No | — | Exit node for routing. Accepts FQDN, HostName, Tailscale IP, or StableNodeID. Omitting clears any persisted selection. |
-| `state-dir` | No | `<HomeDir>/tailscale/<hostname\|name>/` | Directory for persisting node state. |
+| `accept-routes` | No | `true` | Accept subnet routes advertised by tailnet peers (subnet routers). Set `false` to ignore advertised routes. Node-level: takes effect for whichever side (outbound or inbound) brings the shared tsnet up first. |
+| `state-dir` | No | `<HomeDir>/tailscale/<hostname\|name>/` | Directory for persisting node state. Two adapters sharing this directory (and `hostname` / `control-url`) share the same tsnet identity. |
 
 ### Inapplicable Options
 
@@ -124,8 +132,42 @@ A warning is logged at startup if any of these are set.
 - **First run** requires `auth-key`. After state is persisted to `state-dir`, the key can be removed.
 - **Long-lived nodes** should have key expiry disabled in the Tailscale admin console.
 - **Exit node fallback**: if the specified exit node is unavailable, the adapter falls back to direct routing and logs a warning. It does not automatically select another exit node.
-- **Lazy initialization**: the tsnet server starts on the first `Dial`/`ListenPacket` call, not at mihomo startup.
-- **Multiple proxies**: each `type: tailscale` proxy runs an independent tsnet instance with its own state.
+- **Lazy initialization**: the outbound tsnet server starts on the first `Dial`/`ListenPacket` call (or via the post-startup warmup pass), not at mihomo startup.
+- **Lifecycle-bound warmup**: `Close()` cancels any in-flight warmup or lazy init before releasing the shared instance, so stale config generations stop cleanly during reload.
+- **Shared identity**: an outbound proxy and an inbound listener that resolve to the same identity tuple (`state-dir`, `control-url`, sanitized `hostname`-or-`name`) share a single tsnet server. They appear as **one device** on the Tailscale control plane. Differently named entries remain fully independent.
+
+### Sharing One Tailnet Identity Between Outbound and Inbound
+
+The most common deployment uses one tailnet identity to (a) route mihomo traffic out through Tailscale, and (b) expose local services to the tailnet. To make outbound and inbound share that identity, give them the same `hostname` (or the same `state-dir`) and the same `control-url`:
+
+```yaml
+proxies:
+  - name: ts-home
+    type: tailscale
+    auth-key: tskey-auth-xxxxxxxxxxxxxxxxxxxxx
+    hostname: ts-home              # identity anchor
+    accept-routes: true
+
+listeners:
+  - name: ts-home-services
+    type: tailscale
+    hostname: ts-home              # same identity → shared tsnet
+    forwards:
+      - listen: 22
+        target: 127.0.0.1:22
+      - listen: 80
+        target: 127.0.0.1:8080
+```
+
+What happens internally:
+
+- Both entries call `tailscale.Acquire(opts)` against a process-wide registry keyed by the resolved identity tuple.
+- The first call creates the shared `*Instance`; the second call reuses that `*Instance` and bumps a reference counter. The tsnet server is created later by the first `Start()` call.
+- `accept-routes` is a node-level preference applied once at `Up()` time; the **first caller wins** if the two entries disagree, and a warning is logged.
+- `auth-key` is normally first-wins as well, with one carve-out: if the first `Acquire` had an empty key (e.g. the outbound can use persisted state) and a later `Acquire` supplies one before the shared `Instance` begins its first `Start()` attempt, the new key is **promoted** onto the shared identity so the upcoming authentication uses it. The promotion is logged at INFO. After `Start()` has taken its option snapshot, later auth-keys are ignored with a WARN.
+- `exit-node` and per-port forwards remain owned by their respective adapters: only outbound applies the exit-node preference, only inbound runs the forward listeners.
+- On config reload, the registry keeps the instance alive for a short grace window (~5 seconds) after the last reference is dropped, so a follow-up `Acquire` with the same identity reuses the live tsnet and avoids redundant device re-registration on the control plane. If the grace timer fires while `Start()` is active, it waits and rechecks after another grace window.
+- If the two entries differ on `state-dir` / `hostname` / `control-url`, they create distinct identities → two devices on the control plane (the pre-registry behavior).
 
 ### Inbound Service Forwarding
 
@@ -161,10 +203,11 @@ Listener-level options:
 | `name` | Yes | — | Listener name. |
 | `type` | Yes | — | Must be `tailscale`. |
 | `auth-key` | First run | — | Tailscale auth key for the listener node. |
-| `hostname` | No | `<name>` | Hostname shown in the Tailscale admin console. |
+| `hostname` | No | `<name>` | Hostname shown in the Tailscale admin console. Identity anchor — match it to an outbound entry to share a single tsnet. |
 | `control-url` | No | Official Tailscale | Custom control plane URL. |
 | `ephemeral` | No | `false` | Creates an ephemeral listener node. |
-| `state-dir` | No | `<HomeDir>/tailscale/<hostname\|name>/` | State directory for this listener node. |
+| `accept-routes` | No | unset | Node-level subnet-route acceptance. Leave unset to inherit whatever the shared instance already has; set explicitly to enforce a value when this listener is the sole holder of the identity. |
+| `state-dir` | No | `<HomeDir>/tailscale/<hostname\|name>/` | State directory. Pair it with an outbound entry on the same directory to share the tsnet identity. |
 | `rule` | No | — | Sub-rule name applied to forwarded traffic. |
 | `proxy` | No | — | Global outbound override for all forwards on this listener. |
 | `forwards` | Yes | — | List of tailnet-side ports to expose. |
@@ -183,6 +226,7 @@ Per-forward options:
 - Forwards listen on the node's Tailscale IPs, not on the host's regular network interfaces.
 - A single Tailscale listener node can expose many forwarded ports through one shared tsnet instance.
 - Forwarding is explicit per port. Userspace tsnet does not provide TUN-style transparent interception.
+- When the listener shares its identity with an outbound proxy, `Listen()` starts the shared Instance eagerly so ports are ready before traffic arrives, and `Start()` on the first caller takes the node-level snapshot for that shared identity.
 
 ## Building
 
@@ -249,28 +293,35 @@ go test -tags with_tailscale ./adapter/outbound/ ./component/tailscalestamp/ -v
 
 ```
 component/tailscale/server.go
-├── Instance              Shared tsnet lifecycle manager
-├── Start()               Create state dir → resolver bypass → tsnet.Up()
-└── Close()               server.Close() + release resolver bypass
+├── ServerOptions             Identity + node-level prefs (incl. accept-routes)
+├── Instance                  Refcounted wrapper around one tsnet.Server
+├── Acquire(opts) → (Instance, releaseFn)
+│                             Identity-keyed registry lookup; first call creates,
+│                             subsequent calls increment a refcount and reuse
+├── release / maybeClose      Refcount decrement; last release schedules close
+│                             with a 5s grace window and waits for active Start()
+├── applyNodePrefs            Syncs node-level prefs (accept-routes) after Up()
+├── Start()                   Context-aware one-shot tsnet.Up() with option snapshot
+│                             and resolver bypass
+└── SanitizeHostname          Normalize to a valid DNS label
 
 adapter/outbound/tailscale.go
-├── TailscaleOption       YAML → Go struct mapping
-├── Tailscale             Embeds *Base, holds *tailscale.Instance
-├── init()                Double-checked one-time init + exit-node sync
-├── setupExitNode()       LocalClient().EditPrefs() → set ExitNodeID
-├── clearExitNode()       Clear persisted ExitNodeID/IP/AutoExitNode
-├── resolveExitNode()     Match peer by ID / DNSName / HostName / IP
-├── DialContext()         server.Dial("tcp") → backfill remote IP → NewConn()
-├── ListenPacketContext() pickTailscaleUDPBind() → server.ListenPacket("udp")
-└── Close()               instance.Close()
+├── TailscaleOption           YAML → Go struct mapping
+├── Tailscale                 Embeds *Base, holds an *Instance + release fn
+├── Warmup()                  Post-startup eager init with TryLock and lifecycle cancel
+├── init()                    Context-aware one-time init + exit-node sync
+├── syncExitNodePreference    Outbound-only preference; not part of identity
+├── DialContext()             server.Dial("tcp") → backfill remote IP → NewConn()
+├── ListenPacketContext()     pickTailscaleUDPBind() → server.ListenPacket("udp")
+└── Close()                   cancel lifecycle + release shared Instance
 
 listener/inbound/tailscale.go
-├── TailscaleOption       Listener-level config + forwards list
-├── TailscaleForward      Per-port forward entry
-├── Listen()              Start shared tsnet instance → create forwards
-├── listenOnServer()      Create TCP/UDP forwards on tailnet ports
-├── listenForwardUDP()    Bind concrete TS IPv4/IPv6 UDP sockets
-└── Close()               Close all forward listeners + instance
+├── TailscaleOption           Listener-level config + forwards list (incl. accept-routes)
+├── TailscaleForward          Per-port forward entry
+├── Listen()                  Acquire shared Instance → Start → create forwards
+├── listenOnServer()          Create TCP/UDP forwards on tailnet ports
+├── listenForwardUDP()        Bind concrete TS IPv4/IPv6 UDP sockets
+└── Close()                   Close forward listeners + release()
 ```
 
 ### Design Decisions
@@ -278,12 +329,16 @@ listener/inbound/tailscale.go
 | Decision | Rationale |
 |---|---|
 | Build tag isolation | tsnet adds ~32 MB; not compiled by default |
-| Lazy init (outbound) | First Dial triggers Up(), avoids blocking startup |
+| Lazy init (outbound) | First Dial triggers Up(), avoids blocking startup; warmup pre-flights after `OnRunning` |
 | Eager init (inbound) | Ports must be ready before traffic arrives |
-| Resolver bypass per instance | tsnet uses stdlib resolver internally; bypass must span the server lifetime |
-| Exit node as declarative state | Setting overwrites previous; omitting clears persisted state |
+| Identity-keyed registry + refcount | Outbound and inbound sharing one identity register exactly one device on the control plane; refcount lets each adapter own its own lifecycle without coordinating directly |
+| 5s grace close on refcount = 0 | Config reload runs Close-then-Listen; the grace window prevents the tsnet from briefly dropping and re-registering |
+| First-wins on conflicting node prefs (auth-key promotes on idle empty cache) | `ephemeral` / `accept-routes` / mismatched non-empty `auth-key` keep the original value with a WARN. The carve-out: an empty cached `auth-key` can be promoted from a follow-up Acquire supplying one before the first `Start()` attempt takes its option snapshot, with an INFO log. |
+| Resolver bypass per process (refcounted) | tsnet uses stdlib resolver internally; the global bypass must outlive every active instance |
+| Exit node as declarative state (outbound only) | Setting overwrites previous; omitting clears persisted state. Not part of identity since multiple outbounds *could* target different exit nodes with the same identity in principle |
+| `accept-routes` lives on `ServerOptions` | Subnet acceptance is a node-level property; lifting it out of outbound lets inbound-only deployments use it too |
 | Silent fallback when exit node unavailable | No ExitNodeID = direct routing; warning log is the only signal |
-| State dir keyed by hostname or name | Human-readable layout with stable defaults |
+| State dir keyed by hostname or name | Human-readable layout with stable defaults; also the identity anchor |
 | Inbound forwards default to `network: auto` | One entry exposes the same port on both TCP and UDP |
 | Explicit per-port service exposure | Userspace tsnet only supports explicit listeners, not TUN-style interception |
 | Runtime version stamp patching | Keeps control plane version display accurate; avoids `ERR-BuildInfo` |
@@ -330,6 +385,8 @@ go build ./... && go build -tags with_tailscale ./...
 - If the specified exit node is unavailable, traffic falls back silently to direct routing
 - All `tailscale` proxy names must be unique within the same mihomo instance
 - Inbound service forwarding is explicit per port; userspace tsnet does not provide transparent forwarding
+- **Sharing is implicit by identity**: any two entries that resolve to the same `(state-dir, control-url, sanitized hostname-or-name)` share a tsnet instance. If you want them isolated, give them distinct hostnames or state directories.
+- **First-wins on shared instances**: when two entries share an identity but disagree on node-level options (`ephemeral`, `accept-routes`, mismatched non-empty `auth-key`), the first `Acquire` wins; the conflict is logged at WARN level. The exception is an empty cached `auth-key` being promoted from a follow-up Acquire's bootstrap key before the first `Start()` attempt takes its option snapshot, with an INFO log.
 - UPX does not support macOS binaries; use gzip for distribution
 
 ## Credits
