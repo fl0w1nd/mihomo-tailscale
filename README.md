@@ -1,4 +1,12 @@
 <h1 align="center">
+  <br>Mihomo has officially supported Tailscale outbound<br>
+  <br>this repository is only for archiving purposes<br>
+</h1>
+
+https://github.com/MetaCubeX/mihomo/pull/2786
+
+
+<h1 align="center">
   <img src="Meta.png" alt="Meta Kernel" width="200">
   <br>mihomo + Tailscale<br>
 </h1>
